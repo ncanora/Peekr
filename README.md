@@ -1,80 +1,38 @@
 # PacketPeekr
 
-A real-time network monitoring tool with algorithmic attack detection and LLM-assisted log analysis. Built with React + TypeScript (frontend) and Go + gopacket (backend).
+A real-time network monitoring dashboard built with Go + React. Captures live packets off a network interface, streams them to a browser via SSE, and provides a dark-themed terminal-style UI for inspection and analysis.
 
-![PacketPeekr UI prototype](ui_proto.png)
+![PacketPeekr UI](ui_proto.png)
 
-*UI Prototype
+---
+
+## What it does right now
+
+- Live packet capture via [gopacket](https://github.com/google/gopacket) + libpcap/npcap
+- Real-time SSE stream to a React dashboard — no polling, no page refresh
+- Parses TCP, UDP, ICMP, ARP, and DNS (including query/answer extraction)
+- Payload capture and hex/ASCII viewer for TCP, UDP, ICMP, and DNS packets
+- Protocol filtering, full-text search (IP, port, MAC, domain), and pause/resume
+- Per-session bandwidth meter (upload / download)
+- Up to 10,000 packets stored in-memory; newest 500 rendered at any time
+- Packet detail drawer with all fields, DNS block, and raw payload viewer
 
 ---
 
 ## Architecture
 
-![PacketPeekr architecture diagram](architecture.png)
+![PacketPeekr Architecture](architecture.png)
 
-### File breakdown
-
-| File | Responsibility |
-|---|---|
-| `devices.go` | One-time setup: enumerate interfaces, resolve own IP, return `pcap.Handle` |
-| `net.go` | Two goroutines: capture loop → ring buffer, broadcast goroutine → SSE |
-| `analyzer.go` | Reads ring buffer concurrently, runs local detection rules, pushes to alert channel |
-| `llm.go` | Consumes alert channel + user requests, builds context, calls LLM API |
-| `logger.go` | Structured JSON logging; doubles as LLM long-term context |
-
-### Data flow
-
-**Live feed**
 ```
-gopacket capture → ring buffer → broadcast goroutine → SSE → React packet table
+gopacket capture → ring buffer → SSE broadcaster → React packet table
 ```
-
-**Attack detection (TODO)** (fully local, no API calls)
-```
-ring buffer → analyzer goroutine → Alert{severity, type, evidence} → alert channel → React alert panel
-```
-
-**LLM mode 1 — log selection (TODO)**
-```
-user selects rows → "Ask LLM" button → POST /api/llm/selection
-→ llm.go builds tight context from selected rows → Anthropic API → React chat panel
-```
-
-**LLM mode 2 — generic chat(TODO)**
-```
-user clicks chat button → POST /api/llm/chat
-→ llm.go injects recent log tail as background context → Anthropic API → React chat panel
-```
-
-### Detectors (`analyzer.go`) (TODO)
-
-Each detector is stateful and self-contained, reading from the shared ring buffer.
-
-| Detector | Technique |
-|---|---|
-| ARP spoofing | IP→MAC table; flag when MAC changes for a known IP or unsolicited ARP replies appear |
-| Port scan | Count distinct dst ports per src IP in a rolling time window |
-| SYN flood | Count SYNs without corresponding ACKs per src |
-| DNS poisoning | Flag unsolicited DNS replies or mismatched transaction IDs |
-| ICMP flood | Volume threshold per src within a time window |
-
-### LLM integration (TODO)
-
-`llm.go` exposes two HTTP handlers. Both inject recent log context automatically — the difference is only what goes in the user message:
-
-- `POST /api/llm/selection` — tight context: selected packet rows + "what is happening here?"
-- `POST /api/llm/chat` — open context: recent log tail + user's free-form question
-
-The React chat panel persists conversation history client-side and sends it on each request so the LLM maintains context across turns.
-
 ---
 
 ## Stack
 
-- **Frontend**: React 19 + TypeScript + Vite
-- **Backend**: Go + [gopacket](https://github.com/google/gopacket)
-- **LLM**: Anthropic API (via `llm.go`)
-- **Transport**: SSE for live packet stream, REST for LLM queries
+- **Frontend** — React 19 + TypeScript + Vite
+- **Backend** — Go + gopacket
+- **Transport** — SSE for live stream, REST for future LLM queries
 
 ---
 
@@ -85,14 +43,16 @@ The React chat panel persists conversation history client-side and sends it on e
 - Go 1.21+
 - Node.js 22+
 - libpcap (`sudo apt install libpcap-dev` / `brew install libpcap`)
-  - must install npcap for Windows (Select compatability mode + support raw 802.11 if on WiFi)
+- Windows: install [npcap](https://npcap.com) with compatibility mode and raw 802.11 support enabled for WiFi
 
 ### Backend
 
 ```bash
 cd backend
 go mod tidy
-sudo go run main.go   # sudo required for raw packet capture
+sudo go run . -v          # verbose: one line per packet
+sudo go run . -list       # list available interfaces
+sudo go run . -iface eth0 # specify interface explicitly
 ```
 
 ### Frontend
@@ -102,17 +62,52 @@ npm install
 npm run dev
 ```
 
+The Vite dev server proxies `/api` to `localhost:8080` automatically.
+
 ---
 
-## Development / Lab Setup
+## Roadmap
 
-For safe testing without a shared network, use a personal hotspot or host-only VM network:
+### Local Attack Detection Analyzer
+Local, fully offline — no API calls involved.
+
+| Detector | Technique |
+|---|---|
+| ARP spoofing | IP→MAC table; flag when MAC changes for a known IP, or unsolicited replies appear |
+| Port scan | Count distinct destination ports per source IP in a rolling time window |
+| SYN flood | Track SYNs without corresponding ACKs per source |
+| DNS poisoning | Flag unsolicited DNS replies or transaction ID mismatches |
+| ICMP flood | Volume threshold per source within a rolling window |
+
+Alerts will appear in the **Alerts** tab with severity levels (high / medium / low) and the raw evidence packets.
+
+### Local ML classifier
+Train a classifier on a public labeled dataset (CICIDS-2017 or NSL-KDD) and integrate it as a second opinion alongside the rule-based detectors. The model runs locally — no data leaves the machine.
+
+### LLM agent
+Two interaction modes:
+
+- **Selection mode** — select packet rows in the table → "Ask LLM" → tight context sent to the model with a focused question
+- **Chat mode** — open-ended conversation with recent log tail injected as background context automatically
+
+The agent will have tools: query packet history, correlate alerts, explain detections in plain English, and suggest mitigations.
+
+### Persistence and graphing
+- Structured JSON logging (`logger.go`) — doubles as long-term LLM context
+- Network speed graphs over time (up/down throughput)
+- PCAP export
+
+---
+
+## Lab Setup
+
+For safe attack simulation without a shared network, use a personal hotspot or a host-only VM interface:
 
 ```
-[Machine A — victim]  ←── hotspot / host-only ───→  [Machine B — attacker]
+[Machine A — victim]  <── hotspot / host-only ──>  [Machine B — attacker]
 ```
 
-Simulate an ARP spoofing attack against your own device:
+Simulate ARP spoofing:
 
 ```bash
 sudo apt install dsniff
@@ -120,36 +115,4 @@ sudo arpspoof -i eth0 -t <victim_ip> <gateway_ip>
 sudo arpspoof -i eth0 -t <gateway_ip> <victim_ip>
 ```
 
-PacketPeekr's ARP detector will flag the attack in the alert panel in real time.
-
----
-
-## Vite / ESLint Notes
-
-### Type-aware lint rules
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      tseslint.configs.recommendedTypeChecked,
-      tseslint.configs.strictTypeChecked,
-      tseslint.configs.stylisticTypeChecked,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-    },
-  },
-])
-```
-
-Optionally add [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific rules.
-
-### React Compiler
-
-Not enabled by default due to build performance impact. See the [React Compiler docs](https://react.dev/learn/react-compiler/installation) to add it.
+The ARP detector will flag it in the Alerts tab in real time once Phase 1 is complete.
