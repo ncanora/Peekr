@@ -81,6 +81,7 @@ The React chat panel persists conversation history client-side and sends it on e
 - Go 1.21+
 - Node.js 18+
 - libpcap (`sudo apt install libpcap-dev` / `brew install libpcap`)
+  - must install npcap for Windows (Select compatability mode + support raw 802.11 if on WiFi)
 
 ### Backend
 
