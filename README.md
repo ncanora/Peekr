@@ -29,24 +29,24 @@ A real-time network monitoring tool with algorithmic attack detection and LLM-as
 gopacket capture → ring buffer → broadcast goroutine → SSE → React packet table
 ```
 
-**Attack detection** (fully local, no API calls)
+**Attack detection (TODO)** (fully local, no API calls)
 ```
 ring buffer → analyzer goroutine → Alert{severity, type, evidence} → alert channel → React alert panel
 ```
 
-**LLM mode 1 — log selection**
+**LLM mode 1 — log selection (TODO)**
 ```
 user selects rows → "Ask LLM" button → POST /api/llm/selection
 → llm.go builds tight context from selected rows → Anthropic API → React chat panel
 ```
 
-**LLM mode 2 — generic chat**
+**LLM mode 2 — generic chat(TODO)**
 ```
 user clicks chat button → POST /api/llm/chat
 → llm.go injects recent log tail as background context → Anthropic API → React chat panel
 ```
 
-### Detectors (`analyzer.go`)
+### Detectors (`analyzer.go`) (TODO)
 
 Each detector is stateful and self-contained, reading from the shared ring buffer.
 
@@ -58,7 +58,7 @@ Each detector is stateful and self-contained, reading from the shared ring buffe
 | DNS poisoning | Flag unsolicited DNS replies or mismatched transaction IDs |
 | ICMP flood | Volume threshold per src within a time window |
 
-### LLM integration
+### LLM integration (TODO)
 
 `llm.go` exposes two HTTP handlers. Both inject recent log context automatically — the difference is only what goes in the user message:
 
