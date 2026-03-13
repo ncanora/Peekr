@@ -2,6 +2,10 @@
 
 A real-time network monitoring tool with algorithmic attack detection and LLM-assisted log analysis. Built with React + TypeScript (frontend) and Go + gopacket (backend).
 
+![Peekr UI prototype](ui_proto.png)
+
+*UI Prototype
+
 ---
 
 ## Architecture
