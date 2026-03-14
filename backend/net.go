@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/google/gopacket"
@@ -17,8 +19,16 @@ const (
 	ProtoUDP     Proto = "UDP"
 	ProtoICMP    Proto = "ICMP"
 	ProtoARP     Proto = "ARP"
+	ProtoDNS     Proto = "DNS"
 	ProtoUnknown Proto = "UNKNOWN"
 )
+
+// DNSInfo holds parsed DNS query/response data.
+type DNSInfo struct {
+	IsResponse bool     `json:"is_response"`
+	Questions  []string `json:"questions"`
+	Answers    []string `json:"answers"`
+}
 
 // PacketInfo is the normalised struct we pass around internally.
 // Raw gopacket.Packet is never sent to the frontend — always convert first.
@@ -32,24 +42,25 @@ type PacketInfo struct {
 	DstPort   uint16    `json:"dst_port"`
 	Protocol  Proto     `json:"protocol"`
 	Length    int       `json:"length"`
-	Info      string    `json:"info"` // human-readable summary
+	Info      string    `json:"info"`
+
+	// Extended fields
+	DNS        *DNSInfo `json:"dns,omitempty"`
+	PayloadHex string   `json:"payload_hex,omitempty"` // hex-encoded raw payload
+	PayloadLen int      `json:"payload_len"`
 }
 
 // CaptureConfig holds runtime options for the capture loop.
 type CaptureConfig struct {
 	Iface      string
-	MaxPackets int  // 0 = infinite
-	Debug      bool // print full per-packet report
-	Verbose    bool // print rolling summary every 100 packets
+	MaxPackets int
+	Debug      bool
+	Verbose    bool
 }
 
 // captureStats tracks protocol counts for verbose mode.
 type captureStats struct {
-	TCP   int
-	UDP   int
-	ARP   int
-	ICMP  int
-	Other int
+	TCP, UDP, ARP, ICMP, DNS, Other int
 }
 
 func (s *captureStats) record(p Proto) {
@@ -62,31 +73,32 @@ func (s *captureStats) record(p Proto) {
 		s.ARP++
 	case ProtoICMP:
 		s.ICMP++
+	case ProtoDNS:
+		s.DNS++
 	default:
 		s.Other++
 	}
 }
 
-// printVerbose prints a one-line summary per packet.
-func printVerbose(p PacketInfo, count int) {
-	fmt.Printf("[%d] %-7s  %-21s -> %-21s  %d bytes\n",
-		count, p.Protocol, srcLabel(p), dstLabel(p), p.Length)
-}
+// parseDNS extracts DNS query/answer info from a DNS layer.
+func parseDNS(dns *layers.DNS) *DNSInfo {
+	d := &DNSInfo{IsResponse: dns.QR}
 
-// srcLabel returns "ip:port" if ports exist, otherwise just the IP.
-func srcLabel(p PacketInfo) string {
-	if p.SrcPort != 0 {
-		return fmt.Sprintf("%s:%d", p.SrcIP, p.SrcPort)
+	for _, q := range dns.Questions {
+		d.Questions = append(d.Questions, string(q.Name))
 	}
-	return p.SrcIP
-}
-
-// dstLabel returns "ip:port" if ports exist, otherwise just the IP.
-func dstLabel(p PacketInfo) string {
-	if p.DstPort != 0 {
-		return fmt.Sprintf("%s:%d", p.DstIP, p.DstPort)
+	for _, a := range dns.Answers {
+		name := string(a.Name)
+		switch a.Type {
+		case layers.DNSTypeA, layers.DNSTypeAAAA:
+			d.Answers = append(d.Answers, fmt.Sprintf("%s → %s", name, a.IP))
+		case layers.DNSTypeCNAME:
+			d.Answers = append(d.Answers, fmt.Sprintf("%s → CNAME %s", name, string(a.CNAME)))
+		default:
+			d.Answers = append(d.Answers, name)
+		}
 	}
-	return p.DstIP
+	return d
 }
 
 // parsePacket converts a raw gopacket.Packet into a PacketInfo.
@@ -96,7 +108,7 @@ func parsePacket(pkt gopacket.Packet) PacketInfo {
 		Length:    pkt.Metadata().Length,
 	}
 
-	// Ethernet layer — MAC addresses
+	// Ethernet — MAC addresses
 	if eth, ok := pkt.Layer(layers.LayerTypeEthernet).(*layers.Ethernet); ok {
 		info.SrcMAC = eth.SrcMAC.String()
 		info.DstMAC = eth.DstMAC.String()
@@ -108,7 +120,7 @@ func parsePacket(pkt gopacket.Packet) PacketInfo {
 		info.SrcIP = net.IP(arp.SourceProtAddress).String()
 		info.DstIP = net.IP(arp.DstProtAddress).String()
 		info.SrcMAC = net.HardwareAddr(arp.SourceHwAddress).String()
-		info.Info = fmt.Sprintf("ARP who-has %s tell %s", info.DstIP, info.SrcIP)
+		info.Info = fmt.Sprintf("who-has %s tell %s", info.DstIP, info.SrcIP)
 		return info
 	}
 
@@ -124,12 +136,42 @@ func parsePacket(pkt gopacket.Packet) PacketInfo {
 		info.DstIP = ip6.DstIP.String()
 	}
 
+	// DNS — check before UDP so port-53 UDP is classified as DNS
+	if dns, ok := pkt.Layer(layers.LayerTypeDNS).(*layers.DNS); ok {
+		info.Protocol = ProtoDNS
+		d := parseDNS(dns)
+		info.DNS = d
+		if dns.QR {
+			info.Info = fmt.Sprintf("response: %s", strings.Join(d.Answers, ", "))
+		} else {
+			info.Info = fmt.Sprintf("query: %s", strings.Join(d.Questions, ", "))
+		}
+		// Still capture port info from UDP layer if present
+		if udp, ok := pkt.Layer(layers.LayerTypeUDP).(*layers.UDP); ok {
+			info.SrcPort = uint16(udp.SrcPort)
+			info.DstPort = uint16(udp.DstPort)
+		}
+		// Payload is the raw DNS message
+		if app := pkt.ApplicationLayer(); app != nil {
+			payload := app.Payload()
+			info.PayloadLen = len(payload)
+			if len(payload) > 0 {
+				info.PayloadHex = hex.EncodeToString(payload)
+			}
+		}
+		return info
+	}
+
 	// TCP
 	if tcp, ok := pkt.Layer(layers.LayerTypeTCP).(*layers.TCP); ok {
 		info.Protocol = ProtoTCP
 		info.SrcPort = uint16(tcp.SrcPort)
 		info.DstPort = uint16(tcp.DstPort)
-		info.Info = fmt.Sprintf("TCP %s:%d → %s:%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort)
+		info.Info = fmt.Sprintf("%s:%d → %s:%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort)
+		if payload := tcp.Payload; len(payload) > 0 {
+			info.PayloadLen = len(payload)
+			info.PayloadHex = hex.EncodeToString(payload)
+		}
 		return info
 	}
 
@@ -138,14 +180,22 @@ func parsePacket(pkt gopacket.Packet) PacketInfo {
 		info.Protocol = ProtoUDP
 		info.SrcPort = uint16(udp.SrcPort)
 		info.DstPort = uint16(udp.DstPort)
-		info.Info = fmt.Sprintf("UDP %s:%d → %s:%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort)
+		info.Info = fmt.Sprintf("%s:%d → %s:%d", info.SrcIP, info.SrcPort, info.DstIP, info.DstPort)
+		if payload := udp.Payload; len(payload) > 0 {
+			info.PayloadLen = len(payload)
+			info.PayloadHex = hex.EncodeToString(payload)
+		}
 		return info
 	}
 
 	// ICMP
-	if _, ok := pkt.Layer(layers.LayerTypeICMPv4).(*layers.ICMPv4); ok {
+	if icmp, ok := pkt.Layer(layers.LayerTypeICMPv4).(*layers.ICMPv4); ok {
 		info.Protocol = ProtoICMP
-		info.Info = fmt.Sprintf("ICMP %s → %s", info.SrcIP, info.DstIP)
+		info.Info = fmt.Sprintf("type=%d code=%d  %s → %s", icmp.TypeCode.Type(), icmp.TypeCode.Code(), info.SrcIP, info.DstIP)
+		if payload := icmp.Payload; len(payload) > 0 {
+			info.PayloadLen = len(payload)
+			info.PayloadHex = hex.EncodeToString(payload)
+		}
 		return info
 	}
 
@@ -154,25 +204,56 @@ func parsePacket(pkt gopacket.Packet) PacketInfo {
 	return info
 }
 
+// printVerbose prints a one-line summary per packet.
+func printVerbose(p PacketInfo, count int) {
+	fmt.Printf("[%d] %-7s  %-21s -> %-21s  %d bytes\n",
+		count, p.Protocol, srcLabel(p), dstLabel(p), p.Length)
+}
+
+func srcLabel(p PacketInfo) string {
+	if p.SrcPort != 0 {
+		return fmt.Sprintf("%s:%d", p.SrcIP, p.SrcPort)
+	}
+	return p.SrcIP
+}
+
+func dstLabel(p PacketInfo) string {
+	if p.DstPort != 0 {
+		return fmt.Sprintf("%s:%d", p.DstIP, p.DstPort)
+	}
+	return p.DstIP
+}
+
 // printReport pretty-prints a PacketInfo to stdout.
-// Only called when CaptureConfig.Debug is true.
 func printReport(p PacketInfo, count int) {
 	fmt.Printf("──────────────────────────────────────\n")
 	fmt.Printf("  #%-6d  %s\n", count, p.Timestamp.Format("15:04:05.000"))
 	fmt.Printf("  Proto    : %s\n", p.Protocol)
 	fmt.Printf("  Src      : %s  (MAC: %s)\n", p.SrcIP, p.SrcMAC)
 	fmt.Printf("  Dst      : %s  (MAC: %s)\n", p.DstIP, p.DstMAC)
+
 	if p.SrcPort != 0 || p.DstPort != 0 {
 		fmt.Printf("  Ports    : %d → %d\n", p.SrcPort, p.DstPort)
 	}
 	fmt.Printf("  Length   : %d bytes\n", p.Length)
 	fmt.Printf("  Info     : %s\n", p.Info)
+
+	if p.DNS != nil {
+		if p.DNS.IsResponse {
+			fmt.Printf("  DNS Ans  : %s\n", strings.Join(p.DNS.Answers, " | "))
+		} else {
+			fmt.Printf("  DNS Q    : %s\n", strings.Join(p.DNS.Questions, " | "))
+		}
+	}
+	if p.PayloadLen > 0 {
+		fmt.Printf("  Payload  : %d bytes\n", p.PayloadLen)
+	}
 }
 
 // StartCapture opens the interface and feeds parsed packets into packetCh.
-// Respects cfg.MaxPackets (0 = run forever), cfg.Debug, and cfg.Verbose.
 func StartCapture(cfg CaptureConfig, packetCh chan<- PacketInfo) error {
 	handle, err := OpenHandle(cfg.Iface)
+
 	if err != nil {
 		return fmt.Errorf("opening handle on %s: %w", cfg.Iface, err)
 	}
@@ -182,7 +263,6 @@ func StartCapture(cfg CaptureConfig, packetCh chan<- PacketInfo) error {
 	src.NoCopy = true
 
 	count := 0
-
 	for pkt := range src.Packets() {
 		parsed := parsePacket(pkt)
 		count++
